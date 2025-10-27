@@ -28,6 +28,8 @@ resource "aws_launch_template" "bastion_lt" {
   image_id      = data.aws_ami.amazon_linux2.id
   instance_type = var.instance_type_bastion
 
+  key_name = aws_key_pair.generated_key.key_name
+
   iam_instance_profile {
     name = aws_iam_instance_profile.bastion_instance_profile.name
   }

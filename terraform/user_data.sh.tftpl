@@ -12,7 +12,7 @@ systemctl enable iptables
 INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
 
 aws ec2 associate-address \
-  --instance-id "${INSTANCE_ID}" \
+  --instance-id "$${INSTANCE_ID}" \
   --allocation-id "${eip_alloc_id}" \
   --region "${region}"
 
@@ -21,11 +21,12 @@ S3_BUCKET="${bucket}"
 BACKUP_PATH="openvpn-config"
 CONFIG_DIR="/etc/openvpn"
 
-mkdir -p "${CONFIG_DIR}"
+mkdir -p "$${CONFIG_DIR}"
 
-aws s3 cp "s3://${S3_BUCKET}/${BACKUP_PATH}/.configured" "${MARKER_FILE}" || echo "OpenVPN is not configured"
+# Try to pull the marker from S3 (if exists, we are in restore mode)
+aws s3 cp "s3://$${S3_BUCKET}/$${BACKUP_PATH}/.configured" "$${MARKER_FILE}" || echo "OpenVPN is not configured"
 
-if [ ! -f "${MARKER_FILE}" ]; then
+if [ ! -f "$${MARKER_FILE}" ]; then
   echo "First run detected. Setting up OpenVPN fresh."
 
   mkdir -p /etc/openvpn/easy-rsa
@@ -78,11 +79,13 @@ ${push_routes}
 ${simultaneous_connections}
 EOF
 
+  BASTION_PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
   cat > /etc/openvpn/client.ovpn <<EOF
 client
 dev tun
 proto udp
-remote $(curl -s http://169.254.169.254/latest/meta-data/public-ipv4) 1194
+remote $${BASTION_PUBLIC_IP} 1194
 resolv-retry infinite
 nobind
 persist-key
@@ -106,21 +109,31 @@ $(cat /etc/openvpn/ta.key)
 </tls-auth>
 EOF
 
-  cp /etc/openvpn/client.ovpn /home/ec2-user/client.ovpn
-  chown ec2-user:ec2-user /home/ec2-user/client.ovpn
-  chmod 600 /home/ec2-user/client.ovpn
-
-  touch "${MARKER_FILE}"
+  # Mark configured and back up to S3
+  touch "$${MARKER_FILE}"
 
   echo "Backing up OpenVPN configuration to S3"
-  aws s3 cp "${CONFIG_DIR}" "s3://${S3_BUCKET}/${BACKUP_PATH}" --recursive
+  aws s3 cp "$${CONFIG_DIR}" "s3://$${S3_BUCKET}/$${BACKUP_PATH}" --recursive
 
 else
   echo "OpenVPN already configured previously. Restoring from S3 backup."
 
-  aws s3 sync "s3://${S3_BUCKET}/${BACKUP_PATH}" "${CONFIG_DIR}"
+  aws s3 sync "s3://$${S3_BUCKET}/$${BACKUP_PATH}" "$${CONFIG_DIR}"
 
   chmod -R 600 /etc/openvpn/*
+fi
+
+# At this point, either we just generated /etc/openvpn/client.ovpn,
+# or we restored it from S3. In both cases, make sure it's available for download
+# and upload it (again) to S3 in a known path.
+
+if [ -f "/etc/openvpn/client.ovpn" ]; then
+  cp /etc/openvpn/client.ovpn /home/ec2-user/client.ovpn || true
+  chown ec2-user:ec2-user /home/ec2-user/client.ovpn || true
+  chmod 600 /home/ec2-user/client.ovpn || true
+
+  # also push a standalone copy to S3 so operator can pull without SSH
+  aws s3 cp /etc/openvpn/client.ovpn "s3://$${S3_BUCKET}/$${BACKUP_PATH}/client.ovpn" || true
 fi
 
 # Enable IP forwarding persistently
@@ -132,16 +145,19 @@ sysctl -p
 # Determine default outbound NIC
 OUT_IFACE=$(ls /sys/class/net | grep -Ev "lo|tun" | head -n1)
 
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "${OUT_IFACE}" -j MASQUERADE
+iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$${OUT_IFACE}" -j MASQUERADE
 iptables-save > /etc/sysconfig/iptables
 
 systemctl enable iptables --now
 systemctl enable openvpn@server --now
 
-# Nice message for operator when they SSH in
 echo "OpenVPN bastion ready.
 Client config: /home/ec2-user/client.ovpn
+Alternate download (no SSH needed):
+  aws s3 cp s3://$${S3_BUCKET}/$${BACKUP_PATH}/client.ovpn ./client.ovpn
+
 To connect from your machine:
   sudo openvpn --config client.ovpn
+
 Then SSH to the private host via its private IP.
 " > /etc/motd
